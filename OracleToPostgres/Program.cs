@@ -1,7 +1,6 @@
 ﻿using Oracle.ManagedDataAccess.Client;
 using OracleToPostgres.Properties;
 using System;
-using System.CodeDom;
 using System.Collections.Generic;
 using System.Data;
 using System.Globalization;
@@ -9,9 +8,6 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text;
-using System.Threading.Tasks;
-using System.Web;
-using static System.Net.Mime.MediaTypeNames;
 
 namespace OracleToPostgres
 {
@@ -20,6 +16,10 @@ namespace OracleToPostgres
     {
         static OracleConnection conn;
         static string schemaName;
+        static string outputDir;
+        static string dbContextDir;
+        // Gom thông tin bảng và khóa thành Dictionary
+        static Dictionary<string, List<(string ColumnName, string DataType, int Length, int Precision, int Scale, string Nullable, bool IsPrimaryKey, List<string> ForeignKeyTables)>> extractTableInfoWithKeys;
         static void Main(string[] args)
         {
             try
@@ -28,32 +28,31 @@ namespace OracleToPostgres
                 schemaName = Settings.Default.SchemaName;
                 using (conn = new OracleConnection(oracleConnStr))
                 {
+                    Console.WriteLine("Connecting to database");
                     conn.Open();
-                    DataTable dt = Common.GetTables(conn, schemaName);
-                    Console.WriteLine("Generating Postgres Create Script...");
-                    string createScript = GeneratePostgresCreateScript(dt);
+                    DataTable dt = Common.GetTablesWithKeys(conn, schemaName);
+                    extractTableInfoWithKeys = Common.ExtractTableInfoWithKeys(dt);
 
-                    Console.WriteLine("Saving Postgres Create Script...");
-                    SavePostgresCreateScriptToFile(createScript);
+
+                    Console.WriteLine("Creatting output directory");
+                    outputDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) + @"\Output\" + DateTime.Now.ToString("yyyy-MM-dd-HHmmss");
+                    if (!Directory.Exists(outputDir))
+                        Directory.CreateDirectory(outputDir);
+                    dbContextDir = Path.Combine(outputDir, "DbContext");
+                    if (!Directory.Exists(dbContextDir))
+                        Directory.CreateDirectory(dbContextDir);
+
+                    Console.WriteLine("Generating Postgres Create Script...");
+                    GeneratePostgresCreateScript();
 
                     Console.WriteLine("Generating class definitions for file...");
-                    var classDefinitions = GenerateClassDefinitions(dt);
-
-                    Console.WriteLine("Saving class definitions...");
-                    SaveClassDefinitionsToFile(classDefinitions);
+                    GenerateClassDefinitions();
 
                     Console.WriteLine("Generating Mapping Classes With Keys...");
-                    dt = Common.GetTablesWithKeys(conn, schemaName);
-                    var mappingClasses = GenerateMappingClassesWithKeys(dt);
-
-                    Console.WriteLine("Saving Mapping Classes...");
-                    SaveMappingClassesWithKeys(mappingClasses);
+                    var mappingClasses = GenerateMappingClassesWithKeys();
 
                     Console.WriteLine("Generating EF6 DbContext With Mappings...");
                     string dbContextCode = GenerateEF6DbContextWithMappings(mappingClasses);
-
-                    Console.WriteLine("Saving EF6 DbContext With Mappings...");
-                    SaveEF6DbContextWithMappings(dbContextCode);
                 }
             }
             catch (Exception ex)
@@ -62,87 +61,79 @@ namespace OracleToPostgres
             }
         }
 
-
-
-        private static string GeneratePostgresCreateScript(DataTable dt)
+        private static void GeneratePostgresCreateScript()
         {
             var scriptBuilder = new StringBuilder();
-            var tables = Common.TablesDictionary(dt);
-            foreach (var table in tables)
+            foreach (var table in extractTableInfoWithKeys)
             {
                 scriptBuilder.AppendLine($"CREATE TABLE {table.Key.ToLower()} (");
                 var columns = new List<string>();
+                var columnsPrimary = new List<string>();
                 foreach (var column in table.Value)
                 {
                     string pgDataType = Common.ConvertOracleToPostgresType(column.DataType, column.Length, column.Precision, column.Scale);
                     string nullable = column.Nullable == "N" ? "NOT NULL" : "";
-                    columns.Add($"    {column.ColumnName.ToLower()} {pgDataType} {nullable}");
+                    string columnName = column.ColumnName.ToLower();
+                    if (!columns.Contains(columnName))
+                        columns.Add($"    {columnName} {pgDataType} {nullable}");
+
+                    if (column.IsPrimaryKey)
+                        columnsPrimary.Add(column.ColumnName);
                 }
                 scriptBuilder.AppendLine(string.Join(",\n", columns));
                 scriptBuilder.AppendLine(");\n");
+
+                if (columnsPrimary.Count > 0)
+                {
+                    scriptBuilder.AppendLine($"ALTER TABLE {table.Key.ToLower()}");
+                    scriptBuilder.AppendLine($"ADD PRIMARY KEY ({string.Join(",\n", columnsPrimary).ToLower()});\n");
+                }
             }
-            return scriptBuilder.ToString();
-        }
 
-
-        private static void SavePostgresCreateScriptToFile(string createScript)
-        {
-            var dir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) + @"\Script";
-            if (!Directory.Exists(dir))
-                Directory.CreateDirectory(dir);
-
-            string fileName = Path.Combine(dir, DateTime.Now.ToString("yyyy-MM-dd-HHmmss") + ".sql");
+            var createScript = scriptBuilder.ToString();
+            // Save to file
+            string fileName = Path.Combine(outputDir, "script.sql");
 
             File.WriteAllText(fileName, createScript);
         }
-        private static Dictionary<string, string> GenerateClassDefinitions(DataTable dt)
+        private static void GenerateClassDefinitions()
         {
             var classDefinitions = new Dictionary<string, string>();
-            var tables = Common.TablesDictionary(dt);
-            foreach (var table in tables)
+            foreach (var table in extractTableInfoWithKeys)
             {
                 var classBuilder = new StringBuilder();
                 classBuilder.AppendLine("using System;");
                 classBuilder.AppendLine();
-                classBuilder.AppendLine($"public partial class {ToTitleCase(table.Key)}");
+                classBuilder.AppendLine($"public partial class {Common.ToTitleCase(table.Key)}");
                 classBuilder.AppendLine("{");
 
-                foreach (var column in table.Value)
+                var columns = table.Value.Select(x => new { x.ColumnName, x.DataType, x.Nullable }).Distinct();
+                var columnsKey = table.Value.Where(x => x.IsPrimaryKey).Select(x => x.ColumnName).ToList();
+                foreach (var column in columns)
                 {
+                    if (columnsKey.Contains(column.ColumnName))
+                        classBuilder.AppendLine($"    [Key]");
+                    classBuilder.AppendLine($"    [Column(\"{column.ColumnName.ToLower()}\")]");
                     string csDataType = Common.ConvertOracleTypeToCSharpType(column.DataType, column.Nullable);
-                    classBuilder.AppendLine($"    public {csDataType} {ToTitleCase(column.ColumnName)} {{ get; set; }}");
+                    classBuilder.AppendLine($"    public {csDataType} {Common.ToTitleCase(column.ColumnName)} {{ get; set; }}");
                 }
 
                 classBuilder.AppendLine("}");
                 classDefinitions[table.Key] = classBuilder.ToString();
             }
-            return classDefinitions;
-        }
-
-        public static string ToTitleCase(string str)
-        {
-            return CultureInfo.CurrentCulture.TextInfo.ToTitleCase(str.ToLower());
-        }
-        private static void SaveClassDefinitionsToFile(Dictionary<string, string> classDefinitions)
-        {
-            var dir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) + @"\ClassDefinition\" + DateTime.Now.ToString("yyyy-MM-dd-HHmmss");
-            if (!Directory.Exists(dir))
-                Directory.CreateDirectory(dir);
+            // Save to file
             foreach (var classDefinition in classDefinitions)
             {
-                string fileName = Path.Combine(dir, $"{ToTitleCase(classDefinition.Key)}.cs");
-
+                string fileName = Path.Combine(outputDir, $"{Common.ToTitleCase(classDefinition.Key)}.cs");
                 File.WriteAllText(fileName, classDefinition.Value);
             }
         }
 
-        private static Dictionary<string, string> GenerateMappingClassesWithKeys(DataTable dt)
+        private static Dictionary<string, string> GenerateMappingClassesWithKeys()
         {
             var mappingClasses = new Dictionary<string, string>();
 
-            var tables = Common.ExtractTableInfoWithKeys(dt); // Hàm gom thông tin bảng và khóa thành Dictionary
-
-            foreach (var table in tables)
+            foreach (var table in extractTableInfoWithKeys)
             {
                 var classBuilder = new StringBuilder();
                 classBuilder.AppendLine("using System.Data.Entity.ModelConfiguration;");
@@ -188,7 +179,7 @@ namespace OracleToPostgres
                 }
 
                 // Cấu hình khóa ngoại
-                foreach (var column in table.Value.Where(c => c.ForeignKeyTables.Count>0))
+                foreach (var column in table.Value.Where(c => c.ForeignKeyTables.Count > 0))
                 {
                     foreach (var foreignKeyTable in column.ForeignKeyTables)
                     {
@@ -208,21 +199,15 @@ namespace OracleToPostgres
                 mappingClasses.Add(table.Key, classBuilder.ToString());
             }
 
-            return mappingClasses;
-        }
-        private static void SaveMappingClassesWithKeys(Dictionary<string, string> mappingClasses)
-        {
-            var dir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) + @"\MappingClasses\" + DateTime.Now.ToString("yyyy-MM-dd-HHmmss");
-            if (!Directory.Exists(dir))
-                Directory.CreateDirectory(dir);
-
+            //Save to file
             foreach (var mappingClass in mappingClasses)
             {
-                string filePath = Path.Combine(dir, $"{mappingClass.Key}Mapping.cs");
+                string filePath = Path.Combine(dbContextDir, $"{mappingClass.Key}Mapping.cs");
                 File.WriteAllText(filePath, mappingClass.Value);
             }
-        }
 
+            return mappingClasses;
+        }
         private static string GenerateEF6DbContextWithMappings(Dictionary<string, string> classDefinitions)
         {
             var contextBuilder = new StringBuilder();
@@ -246,17 +231,13 @@ namespace OracleToPostgres
             contextBuilder.AppendLine("    }");
             contextBuilder.AppendLine("}");
 
-            return contextBuilder.ToString();
-        }
+            var dbContextCode = contextBuilder.ToString();
 
-        private static void SaveEF6DbContextWithMappings(string dbContextCode)
-        {
-            var dir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) + @"\ApplicationDbContext\" + DateTime.Now.ToString("yyyy-MM-dd-HHmmss");
-            if (!Directory.Exists(dir))
-                Directory.CreateDirectory(dir);
-
-            string filePath = Path.Combine(dir, "ApplicationDbContext.cs");
+            //Save to file
+            string filePath = Path.Combine(dbContextDir, "ApplicationDbContext.cs");
             File.WriteAllText(filePath, dbContextCode);
+
+            return dbContextCode;
         }
 
 
