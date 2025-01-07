@@ -68,25 +68,23 @@ namespace OracleToPostgres
             {
                 scriptBuilder.AppendLine($"CREATE TABLE {table.Key.ToLower()} (");
                 var columns = new List<string>();
-                var columnsPrimary = new List<string>();
                 foreach (var column in table.Value)
                 {
                     string pgDataType = Common.ConvertOracleToPostgresType(column.DataType, column.Length, column.Precision, column.Scale);
-                    string nullable = column.Nullable == "N" ? "NOT NULL" : "";
+                    string nullable = column.Nullable == "N" ? " NOT NULL" : "";
                     string columnName = column.ColumnName.ToLower();
                     if (!columns.Contains(columnName))
-                        columns.Add($"    {columnName} {pgDataType} {nullable}");
-
-                    if (column.IsPrimaryKey)
-                        columnsPrimary.Add(column.ColumnName);
+                        columns.Add($"    {columnName} {pgDataType}{nullable}");
                 }
                 scriptBuilder.AppendLine(string.Join(",\n", columns));
                 scriptBuilder.AppendLine(");\n");
 
-                if (columnsPrimary.Count > 0)
+                // Xác định khóa chính
+                var primaryKeys = table.Value.Where(c => c.IsPrimaryKey).Select(c => c.ColumnName).ToList();
+                if (primaryKeys.Count > 0)
                 {
                     scriptBuilder.AppendLine($"ALTER TABLE {table.Key.ToLower()}");
-                    scriptBuilder.AppendLine($"ADD PRIMARY KEY ({string.Join(",\n", columnsPrimary).ToLower()});\n");
+                    scriptBuilder.AppendLine($"ADD PRIMARY KEY ({string.Join(",\n", primaryKeys[0]).ToLower()});\n");
                 }
             }
 
@@ -103,21 +101,58 @@ namespace OracleToPostgres
             {
                 var classBuilder = new StringBuilder();
                 classBuilder.AppendLine("using System;");
+                classBuilder.AppendLine("using System.ComponentModel.DataAnnotations;");
+                classBuilder.AppendLine("using System.ComponentModel.DataAnnotations.Schema;");
                 classBuilder.AppendLine();
                 classBuilder.AppendLine($"public partial class {Common.ToTitleCase(table.Key)}");
                 classBuilder.AppendLine("{");
 
+                // Dựa vào cấu hình khoá ngoại để thêm contructor khởi tạo các đối tượng navigate (quan hệ với bảng khác)
+                var columnsHasForeignKey = table.Value.Where(c => c.ForeignKeyTables.Count > 0);
+                if (columnsHasForeignKey.Count() > 0)
+                {
+                    classBuilder.AppendLine($"    public {Common.ToTitleCase(table.Key)}()");
+                    classBuilder.AppendLine($"    (");
+                    foreach (var column in columnsHasForeignKey)
+                    {
+                        foreach (var foreignKeyTable in column.ForeignKeyTables)
+                        {
+                            string tableTitleCase = Common.ToTitleCase(foreignKeyTable);
+                            classBuilder.AppendLine($"        {tableTitleCase} = new HashSet<{tableTitleCase}>();");
+                        }
+                    }
+                    classBuilder.AppendLine($"    )");
+                }
+                classBuilder.AppendLine();
                 var columns = table.Value.Select(x => new { x.ColumnName, x.DataType, x.Nullable }).Distinct();
+
+                // Xác định khóa chính
                 var columnsKey = table.Value.Where(x => x.IsPrimaryKey).Select(x => x.ColumnName).ToList();
                 foreach (var column in columns)
                 {
                     if (columnsKey.Contains(column.ColumnName))
+                    {
                         classBuilder.AppendLine($"    [Key]");
+                        classBuilder.AppendLine($"    [DatabaseGenerated(DatabaseGeneratedOption.None)]");
+                    }
                     classBuilder.AppendLine($"    [Column(\"{column.ColumnName.ToLower()}\")]");
                     string csDataType = Common.ConvertOracleTypeToCSharpType(column.DataType, column.Nullable);
                     classBuilder.AppendLine($"    public {csDataType} {Common.ToTitleCase(column.ColumnName)} {{ get; set; }}");
                 }
 
+                // Dựa vào cấu hình khoá ngoại để thêm thuộc tính navigate (quan hệ với bảng khác)
+                if (columnsHasForeignKey.Count() > 0)
+                {
+                    classBuilder.AppendLine();
+                    foreach (var column in columnsHasForeignKey)
+                    {
+                        foreach (var foreignKeyTable in column.ForeignKeyTables)
+                        {
+                            string tableTitleCase = Common.ToTitleCase(foreignKeyTable);
+                            classBuilder.AppendLine($"    public ICollection<{tableTitleCase}> {tableTitleCase} {{ get; set; }}");
+                        }
+                    }
+                }
                 classBuilder.AppendLine("}");
                 classDefinitions[table.Key] = classBuilder.ToString();
             }
@@ -150,31 +185,33 @@ namespace OracleToPostgres
                 var primaryKeys = table.Value.Where(c => c.IsPrimaryKey).Select(c => c.ColumnName).ToList();
                 if (primaryKeys.Count == 1)
                 {
-                    classBuilder.AppendLine($"        HasKey(e => e.{primaryKeys[0]});");
+                    classBuilder.AppendLine($"        HasKey(e => e.{Common.ToTitleCase(primaryKeys[0])});");
                 }
                 else if (primaryKeys.Count > 1)
                 {
-                    classBuilder.AppendLine($"        HasKey(e => new {{ {string.Join(", ", primaryKeys.Select(pk => "e." + pk))} }});");
+                    classBuilder.AppendLine($"        HasKey(e => new {{ {string.Join(", ", primaryKeys.Select(pk => "e." + Common.ToTitleCase(pk)))} }});");
                 }
 
                 // Cấu hình các thuộc tính
-                foreach (var column in table.Value)
+                var columns = table.Value.Select(x => new { x.ColumnName, x.DataType, x.Length, x.Nullable }).Distinct();
+                foreach (var column in columns)
                 {
                     string csDataType = Common.ConvertOracleTypeToCSharpType(column.DataType, column.Nullable);
+                    string columnNameTitleCase = Common.ToTitleCase(column.ColumnName);
                     string columnNameLower = column.ColumnName.ToLower();
 
                     if (column.Nullable == "Y")
                     {
-                        classBuilder.AppendLine($"        Property(e => e.{column.ColumnName}).IsOptional().HasColumnName(\"{columnNameLower}\");");
+                        classBuilder.AppendLine($"        Property(e => e.{columnNameTitleCase}).IsOptional().HasColumnName(\"{columnNameLower}\");");
                     }
                     else
                     {
-                        classBuilder.AppendLine($"        Property(e => e.{column.ColumnName}).IsRequired().HasColumnName(\"{columnNameLower}\");");
+                        classBuilder.AppendLine($"        Property(e => e.{columnNameTitleCase}).IsRequired().HasColumnName(\"{columnNameLower}\");");
                     }
 
                     if (csDataType == "string" && column.Length > 0)
                     {
-                        classBuilder.AppendLine($"        Property(e => e.{column.ColumnName}).HasMaxLength({column.Length});");
+                        classBuilder.AppendLine($"        Property(e => e.{columnNameTitleCase}).HasMaxLength({column.Length});");
                     }
                 }
 
@@ -183,26 +220,22 @@ namespace OracleToPostgres
                 {
                     foreach (var foreignKeyTable in column.ForeignKeyTables)
                     {
-                        string foreignKeyTableLower = foreignKeyTable.ToLower();
-                        classBuilder.AppendLine($"        HasRequired(e => e.{foreignKeyTable})");
+                        classBuilder.AppendLine($"        HasRequired(e => e.{Common.ToTitleCase(foreignKeyTable)})");
                         classBuilder.AppendLine($"            .WithMany() // Điều chỉnh nếu là quan hệ một-nhiều");
-                        classBuilder.AppendLine($"            .HasForeignKey(e => e.{column.ColumnName}).HasColumnName(\"{column.ColumnName.ToLower()}\");");
+                        classBuilder.AppendLine($"            .HasForeignKey(e => e.{Common.ToTitleCase(column.ColumnName)}).HasColumnName(\"{column.ColumnName.ToLower()}\");");
                     }
                 }
 
                 classBuilder.AppendLine("    }");
                 classBuilder.AppendLine("}");
-                //if (!mappingClasses.ContainsKey(table.Key))
-                //{
-                //    mappingClasses[table.Key] = classBuilder.ToString();
-                //}
+
                 mappingClasses.Add(table.Key, classBuilder.ToString());
             }
 
             //Save to file
             foreach (var mappingClass in mappingClasses)
             {
-                string filePath = Path.Combine(dbContextDir, $"{mappingClass.Key}Mapping.cs");
+                string filePath = Path.Combine(dbContextDir, $"{Common.ToTitleCase(mappingClass.Key)}Mapping.cs");
                 File.WriteAllText(filePath, mappingClass.Value);
             }
 
@@ -224,7 +257,7 @@ namespace OracleToPostgres
 
             foreach (var tableName in classDefinitions.Keys)
             {
-                contextBuilder.AppendLine($"        modelBuilder.Configurations.Add(new {tableName}Mapping());");
+                contextBuilder.AppendLine($"        modelBuilder.Configurations.Add(new {Common.ToTitleCase(tableName)}Mapping());");
             }
 
             contextBuilder.AppendLine("        base.OnModelCreating(modelBuilder);");

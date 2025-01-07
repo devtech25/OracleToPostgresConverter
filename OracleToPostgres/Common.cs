@@ -13,30 +13,29 @@ namespace OracleToPostgres
         {
             string query = $@"
                  SELECT distinct * FROM (
-                            SELECT cols.COLUMN_ID,
-                                cols.TABLE_NAME, 
-                                cols.COLUMN_NAME, 
-                                cols.DATA_TYPE, 
-                                cols.DATA_LENGTH, 
-                                cols.NULLABLE, 
-                                cols.data_precision, 
-                                cols.data_scale,
-                                cons.CONSTRAINT_TYPE, 
-                                rcons.constraint_name AS r_constraint_name,
-                                rcons.TABLE_NAME AS R_TABLE_NAME
-                            FROM 
-                                ALL_TAB_COLUMNS cols
-                            LEFT JOIN ALL_CONS_COLUMNS ccols 
-                                ON cols.TABLE_NAME = ccols.TABLE_NAME AND cols.COLUMN_NAME = ccols.COLUMN_NAME
-                                    AND ccols.POSITION is not null
-                            LEFT JOIN ALL_CONSTRAINTS cons 
-                                ON ccols.CONSTRAINT_NAME = cons.CONSTRAINT_NAME
-                            LEFT JOIN ALL_CONSTRAINTS rcons 
-                                ON cons.R_CONSTRAINT_NAME = rcons.CONSTRAINT_NAME
-                            WHERE 
-                                cols.OWNER = '{schemaName}'
-                 )
-                 ORDER BY table_name, column_id";
+                   SELECT cols.OWNER a, ccols.OWNER b , cons.OWNER c, rcons.OWNER d, ccols.POSITION, cols.COLUMN_ID,
+                       cols.TABLE_NAME, 
+                       cols.COLUMN_NAME, 
+                       cols.DATA_TYPE, 
+                       cols.DATA_LENGTH, 
+                       cols.NULLABLE, 
+                       cols.data_precision, 
+                       cols.data_scale,
+                       cons.CONSTRAINT_TYPE, 
+                       rcons.constraint_name AS r_constraint_name,
+                       rcons.TABLE_NAME AS R_TABLE_NAME
+                   FROM 
+                       ALL_TAB_COLUMNS cols
+                   LEFT JOIN ALL_CONS_COLUMNS ccols 
+                       ON cols.TABLE_NAME = ccols.TABLE_NAME AND cols.COLUMN_NAME = ccols.COLUMN_NAME and ccols.OWNER = '{schemaName}'
+                   LEFT JOIN ALL_CONSTRAINTS cons 
+                       ON ccols.CONSTRAINT_NAME = cons.CONSTRAINT_NAME and cons.OWNER = '{schemaName}'
+                   LEFT JOIN ALL_CONSTRAINTS rcons 
+                       ON cons.R_CONSTRAINT_NAME = rcons.CONSTRAINT_NAME and rcons.OWNER = '{schemaName}'
+                   WHERE 
+                       cols.OWNER = '{schemaName}'
+                )
+                ORDER BY table_name, column_id";
 
             OracleCommand cmd = new OracleCommand(query, conn);
             OracleDataAdapter adapter = new OracleDataAdapter(cmd);
@@ -243,7 +242,8 @@ namespace OracleToPostgres
                 int precision = row["DATA_PRECISION"] != DBNull.Value ? Convert.ToInt32(row["DATA_PRECISION"]) : 0;
                 int scale = row["DATA_SCALE"] != DBNull.Value ? Convert.ToInt32(row["DATA_SCALE"]) : 0;
                 string nullable = row["NULLABLE"].ToString();
-                bool isPrimaryKey = primaryKeyConstraints.ContainsKey(tableName) && primaryKeyConstraints[tableName].Contains(columnName);
+                string constraint_type = row["CONSTRAINT_TYPE"].ToString();
+                bool isPrimaryKey = constraint_type == "P" && primaryKeyConstraints.ContainsKey(tableName) && primaryKeyConstraints[tableName].Contains(columnName);
                 List<string> foreignKeyTables = foreignKeyConstraints.ContainsKey(tableName) && foreignKeyConstraints[tableName].ContainsKey(columnName)
                     ? foreignKeyConstraints[tableName][columnName]
                     : new List<string>();
