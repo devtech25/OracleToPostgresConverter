@@ -3,7 +3,6 @@ using OracleToPostgres.Properties;
 using System;
 using System.Collections.Generic;
 using System.Data;
-using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -11,11 +10,9 @@ using System.Text;
 
 namespace OracleToPostgres
 {
-
-    internal class Program
+    static class Program
     {
         static OracleConnection conn;
-        static string schemaName;
         static string outputDir;
         static string dbContextDir;
         // Gom thông tin bảng và khóa thành Dictionary
@@ -25,19 +22,16 @@ namespace OracleToPostgres
             try
             {
                 string oracleConnStr = Settings.Default.OracleConnStr;
-                schemaName = Settings.Default.SchemaName;
                 using (conn = new OracleConnection(oracleConnStr))
                 {
                     Console.WriteLine("Connecting to database");
                     conn.Open();
-                    DataTable dt = Common.GetTablesWithKeys(conn, schemaName);
+                    DataTable dt = Common.GetTablesWithKeys(conn, Settings.Default.SchemaName);
                     extractTableInfoWithKeys = Common.ExtractTableInfoWithKeys(dt);
 
 
                     Console.WriteLine("Creatting output directory");
                     outputDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) + @"\Output\" + DateTime.Now.ToString("yyyy-MM-dd-HHmmss");
-                    if (!Directory.Exists(outputDir))
-                        Directory.CreateDirectory(outputDir);
                     dbContextDir = Path.Combine(outputDir, "DbContext");
                     if (!Directory.Exists(dbContextDir))
                         Directory.CreateDirectory(dbContextDir);
@@ -52,7 +46,7 @@ namespace OracleToPostgres
                     var mappingClasses = GenerateMappingClassesWithKeys();
 
                     Console.WriteLine("Generating EF6 DbContext With Mappings...");
-                    string dbContextCode = GenerateEF6DbContextWithMappings(mappingClasses);
+                    GenerateEF6DbContextWithMappings(mappingClasses);
                 }
             }
             catch (Exception ex)
@@ -60,7 +54,6 @@ namespace OracleToPostgres
                 Console.WriteLine("Error: " + ex.Message);
             }
         }
-
         private static void GeneratePostgresCreateScript()
         {
             var scriptBuilder = new StringBuilder();
@@ -99,6 +92,11 @@ namespace OracleToPostgres
             var classDefinitions = new Dictionary<string, string>();
             foreach (var table in extractTableInfoWithKeys)
             {
+                string tableName = table.Key;
+                var columns = table.Value.Select(x => new { x.ColumnName, x.DataType, x.Nullable }).Distinct();
+                var primaryKeyColumns = table.Value.Where(x => x.IsPrimaryKey);
+                var foreignKeyColumns = table.Value.Where(x => x.ForeignKeyTables.Count > 0);
+
                 var classBuilder = new StringBuilder();
                 classBuilder.AppendLine("using System;");
                 classBuilder.AppendLine("using System.ComponentModel.DataAnnotations;");
@@ -107,30 +105,36 @@ namespace OracleToPostgres
                 classBuilder.AppendLine($"public partial class {Common.ToTitleCase(table.Key)}");
                 classBuilder.AppendLine("{");
 
-                // Dựa vào cấu hình khoá ngoại để thêm contructor khởi tạo các đối tượng navigate (quan hệ với bảng khác)
-                var columnsHasForeignKey = table.Value.Where(c => c.ForeignKeyTables.Count > 0);
-                if (columnsHasForeignKey.Count() > 0)
+                // Liệt kê các thuộc tính điều hướng cho khoá ngoại (một-nhiều) (HasMany)
+                List<string> relatedTables = new List<string>();
+                foreach (var relatedTable in extractTableInfoWithKeys)
+                {
+                    string relatedTableName = relatedTable.Key;
+                    var relatedColumns = relatedTable.Value;
+                    var foreignKeys = relatedColumns.Where(c => c.ForeignKeyTables.Contains(tableName)).Select(c => c.ColumnName).ToList();
+                    if(foreignKeys.Any())
+                    {
+                        relatedTables.Add(relatedTableName);
+                    }    
+                }
+
+                // Khởi tạo các thuộc tính điều hướng cho khoá ngoại (một-nhiều) (HasMany) trong contructor
+                if(relatedTables.Any())
                 {
                     classBuilder.AppendLine($"    public {Common.ToTitleCase(table.Key)}()");
                     classBuilder.AppendLine($"    (");
-                    foreach (var column in columnsHasForeignKey)
+                    foreach (var relatedTable in relatedTables)
                     {
-                        foreach (var foreignKeyTable in column.ForeignKeyTables)
-                        {
-                            string tableTitleCase = Common.ToTitleCase(foreignKeyTable);
-                            classBuilder.AppendLine($"        {tableTitleCase} = new HashSet<{tableTitleCase}>();");
-                        }
+                            string tableTitleCase = Common.ToTitleCase(relatedTable);
+                            classBuilder.AppendLine($"        {tableTitleCase}s = new HashSet<{tableTitleCase}>();");
                     }
                     classBuilder.AppendLine($"    )");
                 }
-                classBuilder.AppendLine();
-                var columns = table.Value.Select(x => new { x.ColumnName, x.DataType, x.Nullable }).Distinct();
 
-                // Xác định khóa chính
-                var columnsKey = table.Value.Where(x => x.IsPrimaryKey).Select(x => x.ColumnName).ToList();
+                // Sinh các thuộc tính cột
                 foreach (var column in columns)
                 {
-                    if (columnsKey.Contains(column.ColumnName))
+                    if (primaryKeyColumns.Select(x=>x.ColumnName).ToList().Contains(column.ColumnName))
                     {
                         classBuilder.AppendLine($"    [Key]");
                         classBuilder.AppendLine($"    [DatabaseGenerated(DatabaseGeneratedOption.None)]");
@@ -140,19 +144,25 @@ namespace OracleToPostgres
                     classBuilder.AppendLine($"    public {csDataType} {Common.ToTitleCase(column.ColumnName)} {{ get; set; }}");
                 }
 
-                // Dựa vào cấu hình khoá ngoại để thêm thuộc tính navigate (quan hệ với bảng khác)
-                if (columnsHasForeignKey.Count() > 0)
+                classBuilder.AppendLine();
+
+                // Sinh các thuộc tính cho khoá ngoại (nhiều-một)
+                foreach (var column in foreignKeyColumns)
                 {
-                    classBuilder.AppendLine();
-                    foreach (var column in columnsHasForeignKey)
+                    foreach (var foreignTable in column.ForeignKeyTables)
                     {
-                        foreach (var foreignKeyTable in column.ForeignKeyTables)
-                        {
-                            string tableTitleCase = Common.ToTitleCase(foreignKeyTable);
-                            classBuilder.AppendLine($"    public ICollection<{tableTitleCase}> {tableTitleCase} {{ get; set; }}");
-                        }
+                        string tableTitleCase = Common.ToTitleCase(foreignTable);
+                        classBuilder.AppendLine($"    public virtual {tableTitleCase} {tableTitleCase} {{ get; set; }}");
                     }
                 }
+
+                // Sinh các thuộc tính điều hướng cho khoá ngoại (một-nhiều) (HasMany)
+                foreach (var relatedTable in relatedTables)
+                {
+                    string tableTitleCase = Common.ToTitleCase(relatedTable);
+                    classBuilder.AppendLine($"    public ICollection<{tableTitleCase}> {tableTitleCase}s {{ get; set; }}");
+                }
+
                 classBuilder.AppendLine("}");
                 classDefinitions[table.Key] = classBuilder.ToString();
             }
@@ -163,23 +173,24 @@ namespace OracleToPostgres
                 File.WriteAllText(fileName, classDefinition.Value);
             }
         }
-
         private static Dictionary<string, string> GenerateMappingClassesWithKeys()
         {
             var mappingClasses = new Dictionary<string, string>();
 
             foreach (var table in extractTableInfoWithKeys)
             {
+                var tableName = Common.ToTitleCase(table.Key);
+
                 var classBuilder = new StringBuilder();
                 classBuilder.AppendLine("using System.Data.Entity.ModelConfiguration;");
                 classBuilder.AppendLine();
-                classBuilder.AppendLine($"public class {table.Key}Mapping : EntityTypeConfiguration<{table.Key}>");
+                classBuilder.AppendLine($"public class {tableName}Mapping : EntityTypeConfiguration<{tableName}>");
                 classBuilder.AppendLine("{");
-                classBuilder.AppendLine($"    public {table.Key}Mapping()");
+                classBuilder.AppendLine($"    public {tableName}Mapping()");
                 classBuilder.AppendLine("    {");
 
                 // Chuyển tên bảng thành chữ thường
-                classBuilder.AppendLine($"        ToTable(\"{table.Key.ToLower()}\");");
+                classBuilder.AppendLine($"        ToTable(\"{tableName.ToLower()}\");");
 
                 // Xác định khóa chính
                 var primaryKeys = table.Value.Where(c => c.IsPrimaryKey).Select(c => c.ColumnName).ToList();
@@ -221,7 +232,7 @@ namespace OracleToPostgres
                     foreach (var foreignKeyTable in column.ForeignKeyTables)
                     {
                         classBuilder.AppendLine($"        HasRequired(e => e.{Common.ToTitleCase(foreignKeyTable)})");
-                        classBuilder.AppendLine($"            .WithMany() // Điều chỉnh nếu là quan hệ một-nhiều");
+                        classBuilder.AppendLine($"            .WithMany(c => c.{tableName}s)");
                         classBuilder.AppendLine($"            .HasForeignKey(e => e.{Common.ToTitleCase(column.ColumnName)}).HasColumnName(\"{column.ColumnName.ToLower()}\");");
                     }
                 }
@@ -241,7 +252,7 @@ namespace OracleToPostgres
 
             return mappingClasses;
         }
-        private static string GenerateEF6DbContextWithMappings(Dictionary<string, string> classDefinitions)
+        private static void GenerateEF6DbContextWithMappings(Dictionary<string, string> classDefinitions)
         {
             var contextBuilder = new StringBuilder();
             contextBuilder.AppendLine("using System.Data.Entity;");
@@ -269,10 +280,6 @@ namespace OracleToPostgres
             //Save to file
             string filePath = Path.Combine(dbContextDir, "ApplicationDbContext.cs");
             File.WriteAllText(filePath, dbContextCode);
-
-            return dbContextCode;
         }
-
-
     }
 }

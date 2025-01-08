@@ -12,30 +12,21 @@ namespace OracleToPostgres
         public static DataTable GetTablesWithKeys(OracleConnection conn, string schemaName)
         {
             string query = $@"
-                 SELECT distinct * FROM (
-                   SELECT cols.OWNER a, ccols.OWNER b , cons.OWNER c, rcons.OWNER d, ccols.POSITION, cols.COLUMN_ID,
-                       cols.TABLE_NAME, 
-                       cols.COLUMN_NAME, 
-                       cols.DATA_TYPE, 
-                       cols.DATA_LENGTH, 
-                       cols.NULLABLE, 
-                       cols.data_precision, 
-                       cols.data_scale,
-                       cons.CONSTRAINT_TYPE, 
-                       rcons.constraint_name AS r_constraint_name,
-                       rcons.TABLE_NAME AS R_TABLE_NAME
-                   FROM 
-                       ALL_TAB_COLUMNS cols
-                   LEFT JOIN ALL_CONS_COLUMNS ccols 
-                       ON cols.TABLE_NAME = ccols.TABLE_NAME AND cols.COLUMN_NAME = ccols.COLUMN_NAME and ccols.OWNER = '{schemaName}'
-                   LEFT JOIN ALL_CONSTRAINTS cons 
-                       ON ccols.CONSTRAINT_NAME = cons.CONSTRAINT_NAME and cons.OWNER = '{schemaName}'
-                   LEFT JOIN ALL_CONSTRAINTS rcons 
-                       ON cons.R_CONSTRAINT_NAME = rcons.CONSTRAINT_NAME and rcons.OWNER = '{schemaName}'
-                   WHERE 
-                       cols.OWNER = '{schemaName}'
-                )
-                ORDER BY table_name, column_id";
+                    SELECT 
+                        a.TABLE_NAME, 
+                        a.COLUMN_NAME, 
+                        a.DATA_TYPE, 
+                        a.DATA_LENGTH, 
+                        a.NULLABLE, 
+                        a.DATA_PRECISION, 
+                        a.DATA_SCALE,
+                        c.CONSTRAINT_TYPE, c.R_CONSTRAINT_NAME, d.TABLE_NAME AS R_TABLE_NAME
+                   FROM ALL_TAB_COLUMNS a
+                   LEFT JOIN ALL_CONS_COLUMNS b ON a.TABLE_NAME = b.TABLE_NAME AND a.COLUMN_NAME = b.COLUMN_NAME and b.OWNER = '{schemaName}'
+                   LEFT JOIN ALL_CONSTRAINTS  c ON b.TABLE_NAME = c.TABLE_NAME AND b.CONSTRAINT_NAME = c.CONSTRAINT_NAME AND c.OWNER = '{schemaName}'
+                   LEFT JOIN ALL_CONSTRAINTS  d ON c.R_CONSTRAINT_NAME = d.CONSTRAINT_NAME AND d.OWNER = '{schemaName}'
+                   WHERE a.OWNER = '{schemaName}'
+                   ORDER BY a.TABLE_NAME, a.COLUMN_ID";
 
             OracleCommand cmd = new OracleCommand(query, conn);
             OracleDataAdapter adapter = new OracleDataAdapter(cmd);
